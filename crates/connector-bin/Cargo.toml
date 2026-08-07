@@ -61,6 +61,10 @@ base64 = "0.22"
 # plain NIP-01 `REQ` over the relay's public WS.
 k256 = { version = "0.13", features = ["schnorr"] }
 sha2 = "0.10"
-tokio-tungstenite = "0.20"
+# `rustls-tls-webpki-roots` matches `connector-cli` and `connector-peer-btp`
+# exactly: without it `connect_async` cannot open a `wss://` at all, and every
+# deployed edge and relay is TLS-fronted. The local rehearsal's `ws://`
+# loopback never needed it, which is why it was absent.
+tokio-tungstenite = { version = "0.20", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }

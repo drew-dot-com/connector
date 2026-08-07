@@ -433,6 +433,151 @@ async fn fetch_price(base: &str, destination: &str) -> u64 {
         .unwrap_or_else(|| panic!("no price for {destination}: {body}"))
 }
 
+/// Where this node's BTP door is, for a route whose policy requires that
+/// carriage (issue #701).
+///
+/// **Derived, because the greeting does not carry it.** #807 added
+/// `extra.btpEndpoint`, but the live devnet greeting for a `transport = "btp"`
+/// route advertises `requiredTransport: "btp"` and no URL to satisfy it with --
+/// the same gap `connector-cli/src/announce.rs` documents and guesses around.
+/// `wss://<host>/ilp/btp` is the deployed convention, and it is a guess; the
+/// override exists so a node that spells it differently is reachable without a
+/// rebuild.
+fn btp_url(edge: &str) -> String {
+    env("SOLANA_PROBE_BTP_URL").unwrap_or_else(|| {
+        format!(
+            "{}/ilp/btp",
+            edge.replacen("https://", "wss://", 1)
+                .replacen("http://", "ws://", 1)
+        )
+    })
+}
+
+/// One paid packet over a BTP session, for a route that refuses HTTP.
+///
+/// Modelled on `announce.rs`'s `send_over_btp` and using the same
+/// [`connector_btp`] codec both roles share (ADR 0027) -- never a second
+/// hand-rolled frame.
+///
+/// **The claim is RAW JSON here, not base64.** That is the one substantive
+/// difference between the two carriages: over HTTP the header value is
+/// base64 of the claim JSON, and over BTP the `payment-channel-claim`
+/// protocolData carries the JSON bytes themselves. Base64-ing it here
+/// produces a claim the far side cannot parse, which is refused exactly like
+/// a malformed one.
+async fn deliver_over_btp(
+    btp_url: &str,
+    prepare: &Prepare,
+    claim: &str,
+) -> Result<Fulfill, String> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    const REQUEST_ID: u32 = 1;
+
+    let (mut socket, _response) = tokio::time::timeout(
+        StdDuration::from_secs(20),
+        tokio_tungstenite::connect_async(btp_url),
+    )
+    .await
+    .map_err(|_| format!("timed out opening {btp_url}"))?
+    .map_err(|error| format!("could not open {btp_url}: {error}"))?;
+
+    let frame = connector_btp::encode_message(
+        REQUEST_ID,
+        &[connector_btp::ProtocolData {
+            name: connector_btp::CLAIM_PROTOCOL.to_string(),
+            content_type: connector_btp::CONTENT_TYPE_TEXT,
+            data: claim.as_bytes().to_vec(),
+        }],
+        &prepare.encode(),
+    );
+    socket
+        .send(Message::Binary(frame))
+        .await
+        .map_err(|error| format!("send: {error}"))?;
+
+    // The session's own advertised lease is 120s; this is one packet, so a
+    // shorter ceiling is honest -- a far side that has not answered by now is
+    // not going to.
+    let answer = tokio::time::timeout(StdDuration::from_secs(60), async {
+        while let Some(message) = socket.next().await {
+            let bytes = match message.map_err(|error| format!("recv: {error}"))? {
+                Message::Binary(bytes) => bytes,
+                Message::Close(_) => return Err("the session closed before answering".to_string()),
+                _ => continue,
+            };
+            let decoded = connector_btp::decode_frame(&bytes)
+                .map_err(|error| format!("undecodable frame: {error:?}"))?;
+            if decoded.request_id != REQUEST_ID {
+                continue;
+            }
+            return Ok(decoded);
+        }
+        Err("the session ended without answering".to_string())
+    })
+    .await
+    .map_err(|_| "no answer within 60s".to_string())??;
+
+    let _ = socket.close(None).await;
+
+    if answer.frame_type == connector_btp::BTP_ERROR {
+        return Err(format!(
+            "BTP ERROR: {}",
+            String::from_utf8_lossy(&answer.ilp_packet)
+        ));
+    }
+    // The BTP twin of the HTTP 402: the identical x402 terms bytes ride as
+    // `payment-required` protocolData on a REJECT.
+    if let Some(terms) = answer
+        .protocol_data
+        .iter()
+        .find(|entry| entry.name == connector_btp::PAYMENT_REQUIRED_PROTOCOL)
+    {
+        return Err(format!(
+            "still unpaid -- x402 terms came back: {}",
+            String::from_utf8_lossy(&terms.data)
+                .chars()
+                .take(300)
+                .collect::<String>()
+        ));
+    }
+    if let Ok(fulfill) = Fulfill::decode(&answer.ilp_packet) {
+        return Ok(fulfill);
+    }
+    match Reject::decode(&answer.ilp_packet) {
+        Ok(reject) => Err(format!(
+            "REJECTED {:?} {}: {}",
+            reject.code, reject.triggered_by, reject.message
+        )),
+        Err(_) => Err("neither a FULFILL nor a REJECT".to_string()),
+    }
+}
+
+/// What transport `destination` requires, from the node's own greeting -- so a
+/// probe never has to be told, and a route that flips to BTP later does not
+/// silently start failing.
+async fn required_transport(edge: &str, destination: &str, target: &str) -> Option<String> {
+    let identity = fetch_identity(edge).await;
+    let (prepare, _secret) = sealed_prepare(
+        fetch_price(edge, destination).await,
+        destination,
+        target,
+        b"{}",
+        &identity,
+    );
+    let response = reqwest::Client::new()
+        .post(format!("{edge}/ilp"))
+        .body(prepare.encode())
+        .send()
+        .await
+        .expect("POST /ilp unpaid");
+    let terms: serde_json::Value = response.json().await.ok()?;
+    terms["accepts"][0]["extra"]["requiredTransport"]
+        .as_str()
+        .map(str::to_string)
+}
+
 /// The `Prepare` a real sender forms: an OER `EnvelopeRequest` gift-wrapped to
 /// the TERMINATING connector's identity (ADR 0018), under a condition minted
 /// from the fulfilment that wrap's shared secret derives (ADR 0019).
@@ -517,7 +662,11 @@ fn write_body(event: &serde_json::Value) -> Vec<u8> {
 /// leaving it to the caller to remember.
 const BLOB_STORAGE_REQUEST_KIND: u64 = 5094;
 
-fn signed_blob_storage_job(blob: &[u8], content_type: &str, bid: u64) -> (serde_json::Value, String) {
+fn signed_blob_storage_job(
+    blob: &[u8],
+    content_type: &str,
+    bid: u64,
+) -> (serde_json::Value, String) {
     use k256::schnorr::signature::hazmat::PrehashSigner;
     use k256::schnorr::SigningKey;
     use sha2::{Digest, Sha256};
@@ -836,25 +985,40 @@ async fn a_paid_solana_claim_buys_a_write_and_advances_the_watermark() {
     let (body, job_id, answer_field) = job_body_for(&destination, &content, price);
     let (prepare, secret) = sealed_prepare(price, &destination, &target(), &body, &identity);
 
-    let response = reqwest::Client::new()
-        .post(format!("{edge}/ilp"))
-        .header(CLAIM_HEADER, BASE64.encode(claim.as_bytes()))
-        .body(prepare.encode())
-        .send()
-        .await
-        .expect("POST /ilp");
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    let body = response.bytes().await.expect("response body");
-
-    // A REJECT decodes here first so a failure names itself, rather than
-    // surfacing as an opaque "could not decode a Fulfill".
-    if let Ok(reject) = Reject::decode(&body) {
-        panic!(
-            "REJECTED {:?} {}: {}",
-            reject.code, reject.triggered_by, reject.message
-        );
-    }
-    let fulfill = Fulfill::decode(&body).expect("a Fulfill");
+    // Which carriage this route accepts is the node's decision, not this
+    // probe's, so it is read from the greeting rather than configured here --
+    // a route that flips to BTP later keeps working instead of silently
+    // failing with a 402 that looks like an unpaid packet.
+    let transport = required_transport(&edge, &destination, &target()).await;
+    let fulfill = match transport.as_deref() {
+        Some("btp") => {
+            let url = btp_url(&edge);
+            println!("route requires BTP -- delivering over {url}");
+            deliver_over_btp(&url, &prepare, &claim)
+                .await
+                .unwrap_or_else(|error| panic!("{error}"))
+        }
+        _ => {
+            let response = reqwest::Client::new()
+                .post(format!("{edge}/ilp"))
+                .header(CLAIM_HEADER, BASE64.encode(claim.as_bytes()))
+                .body(prepare.encode())
+                .send()
+                .await
+                .expect("POST /ilp");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let body = response.bytes().await.expect("response body");
+            // A REJECT decodes first so a failure names itself, rather than
+            // surfacing as an opaque "could not decode a Fulfill".
+            if let Ok(reject) = Reject::decode(&body) {
+                panic!(
+                    "REJECTED {:?} {}: {}",
+                    reject.code, reject.triggered_by, reject.message
+                );
+            }
+            Fulfill::decode(&body).expect("a Fulfill")
+        }
+    };
     // The fulfilment is derivable only from the shared secret this sender
     // minted the condition under (ADR 0019) -- the app holds no secret and
     // performs no cryptography, so only the node this packet was sealed to
