@@ -134,11 +134,33 @@ fn destination() -> String {
     env("SOLANA_PROBE_DESTINATION").unwrap_or_else(|| "g.drew.relay".to_string())
 }
 
-/// `""` would resolve to the handler URL's own base rather than its path --
-/// see `devnet_store_leg_probe.rs`'s note. The relay's paid-write endpoint is
-/// `/write` beneath `http://relay:3100`.
+/// The envelope target, defaulted BY ROUTE because the two routes want
+/// opposite things and getting it wrong is an F00 that reads like a client
+/// bug:
+///
+///   * a relay route's `handler_url` is `http://relay:3100` and the app
+///     serves `POST /write`, so the target must be `/write`;
+///   * an `.ario`/`.store` route's `handler_url` already ends in `/store`,
+///     and `resolve_target_under_handler` appends the target BENEATH it --
+///     so an absolute `/write` is refused outright (issue #621) and `""`,
+///     meaning "the route's own handler path", is what a client with exactly
+///     one endpoint sends.
+///
+/// Read with `var` rather than [`env`] so that an explicitly empty
+/// `SOLANA_PROBE_TARGET=""` is honoured as the meaningful value it is, not
+/// discarded as absent.
 fn target() -> String {
-    env("SOLANA_PROBE_TARGET").unwrap_or_else(|| "/write".to_string())
+    match std::env::var("SOLANA_PROBE_TARGET") {
+        Ok(value) => value,
+        Err(_) => {
+            let destination = destination();
+            if destination.ends_with(".ario") || destination.ends_with(".store") {
+                String::new()
+            } else {
+                "/write".to_string()
+            }
+        }
+    }
 }
 
 fn rpc() -> RpcClient {
@@ -484,6 +506,69 @@ fn write_body(event: &serde_json::Value) -> Vec<u8> {
         .into_bytes()
 }
 
+/// NIP-90 Arweave blob-storage job (`@toon-protocol/core`'s
+/// `buildBlobStorageRequest`) -- what an `.ario`/`.store` route's app wants,
+/// as opposed to a relay's `{"event": <kind:1>}`.
+///
+/// Sending the wrong one of these two is not a loud failure. Under ADR 0020 a
+/// non-2xx from the app is a real answer that consumed real work, so it rides
+/// home on a FULFILL carrying `status: 422` and the payer is charged in full
+/// for nothing. That is why [`job_body_for`] picks by route rather than
+/// leaving it to the caller to remember.
+const BLOB_STORAGE_REQUEST_KIND: u64 = 5094;
+
+fn signed_blob_storage_job(blob: &[u8], content_type: &str, bid: u64) -> (serde_json::Value, String) {
+    use k256::schnorr::signature::hazmat::PrehashSigner;
+    use k256::schnorr::SigningKey;
+    use sha2::{Digest, Sha256};
+
+    // A per-run key: this event is a receipt for one upload, never
+    // republished, so a fixed key would only make two runs indistinguishable.
+    let mut seed = [0u8; 32];
+    seed[..8].copy_from_slice(&now_secs().to_be_bytes());
+    seed[8..24].copy_from_slice(&Sha256::digest(blob)[..16]);
+    seed[31] |= 1; // never the zero scalar
+    let signing_key = SigningKey::from_bytes(&seed).expect("nostr signing key");
+    let pubkey = hex_encode(&signing_key.verifying_key().to_bytes());
+    let created_at = now_secs();
+
+    let tags = serde_json::json!([
+        ["i", BASE64.encode(blob), "blob"],
+        ["bid", bid.to_string(), "usdc"],
+        ["output", content_type],
+    ]);
+    let serialized =
+        serde_json::json!([0, pubkey, created_at, BLOB_STORAGE_REQUEST_KIND, tags, ""]).to_string();
+    let id = hex_encode(&Sha256::digest(serialized.as_bytes()));
+    let signature: k256::schnorr::Signature = signing_key
+        .sign_prehash(&hex_decode(&id))
+        .expect("schnorr sign the event id");
+
+    let event = serde_json::json!({
+        "id": id,
+        "pubkey": pubkey,
+        "created_at": created_at,
+        "kind": BLOB_STORAGE_REQUEST_KIND,
+        "tags": tags,
+        "content": "",
+        "sig": hex_encode(&signature.to_bytes()),
+    });
+    (event, id)
+}
+
+/// The right body for `destination`, and the field of the app's answer that
+/// names what it did with it. A `.ario`/`.store` prefix gets a kind:5094
+/// blob-storage job; anything else gets a relay write.
+fn job_body_for(destination: &str, note: &str, price: u64) -> (Vec<u8>, String, &'static str) {
+    if destination.ends_with(".ario") || destination.ends_with(".store") {
+        let (event, id) = signed_blob_storage_job(note.as_bytes(), "text/plain", price);
+        (write_body(&event), id, "txId")
+    } else {
+        let (event, id) = signed_nostr_event(note);
+        (write_body(&event), id, "eventId")
+    }
+}
+
 // ── 1. what the chain says ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -533,6 +618,50 @@ async fn the_channel_is_open_and_funded_on_chain_in_the_nodes_own_mint() {
         deposit > 0,
         "the payer's own side of the deposit is 0, so every claim would be \
          refused as undercollateralized"
+    );
+}
+
+// ── 1b. discovering a node's Solana settlement address ───────────────────────
+
+/// The node's own x402 greeting (client-edge-spec.md §1.4), which is how a
+/// client that has never met this node learns WHERE to open a channel: the
+/// settlement address is `key_file`-backed and therefore appears in no config
+/// a stranger could read.
+///
+/// The greeting answers an UNPAID request to a priced route, so this costs
+/// nothing -- but the request must still be a well-formed `Prepare`, or the
+/// edge answers "buffer underflow: packet is truncated" rather than terms.
+/// That is the whole trap: an empty POST looks like a broken node.
+#[tokio::test]
+async fn the_nodes_greeting_names_where_to_open_a_solana_channel() {
+    let Some(edge) = edge() else {
+        return;
+    };
+    let destination = destination();
+    let identity = fetch_identity(&edge).await;
+    let (prepare, _secret) = sealed_prepare(
+        fetch_price(&edge, &destination).await,
+        &destination,
+        &target(),
+        b"{}",
+        &identity,
+    );
+
+    let response = reqwest::Client::new()
+        .post(format!("{edge}/ilp"))
+        .body(prepare.encode())
+        .send()
+        .await
+        .expect("POST /ilp unpaid");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::PAYMENT_REQUIRED,
+        "an unpaid request to a priced route is answered with x402 terms"
+    );
+    let terms: serde_json::Value = response.json().await.expect("x402 terms json");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&terms).expect("pretty terms")
     );
 }
 
@@ -704,14 +833,8 @@ async fn a_paid_solana_claim_buys_a_write_and_advances_the_watermark() {
         "paid over the Solana settlement leg -- channel {account} nonce {nonce} at {}",
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
     );
-    let (event, event_id) = signed_nostr_event(&content);
-    let (prepare, secret) = sealed_prepare(
-        price,
-        &destination,
-        &target(),
-        &write_body(&event),
-        &identity,
-    );
+    let (body, job_id, answer_field) = job_body_for(&destination, &content, price);
+    let (prepare, secret) = sealed_prepare(price, &destination, &target(), &body, &identity);
 
     let response = reqwest::Client::new()
         .post(format!("{edge}/ilp"))
@@ -751,11 +874,22 @@ async fn a_paid_solana_claim_buys_a_write_and_advances_the_watermark() {
         String::from_utf8_lossy(&envelope.body)
     );
     let stored: serde_json::Value =
-        serde_json::from_slice(&envelope.body).expect("the relay's JSON answer");
-    assert_eq!(
-        stored["eventId"], event_id,
-        "the relay must report storing THIS event"
-    );
+        serde_json::from_slice(&envelope.body).expect("the app's JSON answer");
+    // A relay names the event id it stored; an ario/store app names the
+    // Arweave tx id it minted. Either way the answer is the app's own word
+    // about work it did, not this probe's about a packet it sent.
+    if answer_field == "eventId" {
+        assert_eq!(
+            stored["eventId"], job_id,
+            "the relay must report storing THIS event"
+        );
+    } else {
+        println!("stored on Arweave: {}", stored["txId"]);
+        assert!(
+            stored["txId"].as_str().is_some_and(|id| !id.is_empty()),
+            "the store app must answer with a real Arweave tx id: {stored}"
+        );
+    }
 
     // The number a soak is counted in: the node's own durable watermark, read
     // back through the same challenged endpoint, after the packet.
