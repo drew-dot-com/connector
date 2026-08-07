@@ -763,3 +763,171 @@ async fn a_paid_kind_5094_job_crosses_the_peering_and_the_payload_reads_back_fro
         fetched.len()
     );
 }
+
+// ── kind:5095, the ArNS buy leg ──────────────────────────────────────────────
+//
+// The store's arns-buy handler takes its arguments as NIP-90 `["param", k, v]`
+// tags rather than the `["i", ...]` input tag 5094 uses, and it REQUIRES
+// `processId` -- the client's own ANT (an MPL Core asset pubkey), which the
+// client spawns before submitting. That requirement is why rig#41 cannot
+// happen on this path: the direct path's bug is calling `buyRecord` with no
+// processId at all, and a job that omits it here is thrown out by name before
+// any mARIO moves.
+
+/// NIP-90 ArNS-buy job, the second kind the store app serves.
+const ARNS_BUY_REQUEST_KIND: u64 = 5095;
+
+fn signed_arns_buy_job(
+    name: &str,
+    process_id: Option<&str>,
+    buy_type: &str,
+    years: Option<u32>,
+    bid: u64,
+) -> (serde_json::Value, String) {
+    use k256::schnorr::signature::hazmat::PrehashSigner;
+    use k256::schnorr::SigningKey;
+    use sha2::{Digest, Sha256};
+
+    let mut seed = [0u8; 32];
+    seed[..8].copy_from_slice(&now_secs().to_be_bytes());
+    seed[8..24].copy_from_slice(&Sha256::digest(name.as_bytes())[..16]);
+    seed[31] |= 1;
+    let signing_key = SigningKey::from_bytes(&seed).expect("nostr signing key");
+    let pubkey = hex_encode(&signing_key.verifying_key().to_bytes());
+    let created_at = now_secs();
+
+    let mut tags = vec![
+        serde_json::json!(["param", "name", name]),
+        serde_json::json!(["param", "type", buy_type]),
+        serde_json::json!(["bid", bid.to_string(), "usdc"]),
+    ];
+    // Deliberately omissible: leaving it out is how we prove the paid wire
+    // path reaches the handler's validation without spending any mARIO.
+    if let Some(pid) = process_id {
+        tags.push(serde_json::json!(["param", "processId", pid]));
+    }
+    if let Some(y) = years {
+        tags.push(serde_json::json!(["param", "years", y.to_string()]));
+    }
+    let tags = serde_json::Value::Array(tags);
+
+    let serialized =
+        serde_json::json!([0, pubkey, created_at, ARNS_BUY_REQUEST_KIND, tags, ""]).to_string();
+    let id = hex_encode(&Sha256::digest(serialized.as_bytes()));
+    let signature: k256::schnorr::Signature = signing_key
+        .sign_prehash(&hex_decode(&id))
+        .expect("schnorr sign the event id");
+
+    let event = serde_json::json!({
+        "id": id,
+        "pubkey": pubkey,
+        "created_at": created_at,
+        "kind": ARNS_BUY_REQUEST_KIND,
+        "tags": tags,
+        "content": "",
+        "sig": hex_encode(&signature.to_bytes()),
+    });
+    (event, id)
+}
+
+/// Submit one paid kind:5095 job and return the store app's `(status, answer)`.
+///
+/// Inert without `ARNS_PROBE_NAME`, and the ARIO only moves when
+/// `ARNS_PROBE_PROCESS_ID` is also set -- so the default run is the
+/// validation probe, which costs one packet and nothing else.
+#[tokio::test]
+async fn a_paid_kind_5095_arns_buy_reaches_the_handler() {
+    let Some(edge) = edge() else { return };
+    let Some(payer) = Payer::from_env() else {
+        println!("no funded channel in the environment -- 5095 probe SKIPPED (nothing spent)");
+        return;
+    };
+    let Some(name) = env("ARNS_PROBE_NAME") else {
+        println!("ARNS_PROBE_NAME unset -- 5095 probe SKIPPED (nothing spent)");
+        return;
+    };
+    let process_id = env("ARNS_PROBE_PROCESS_ID");
+    let buy_type = env("ARNS_PROBE_TYPE").unwrap_or_else(|| "lease".to_string());
+    let years = env("ARNS_PROBE_YEARS").and_then(|y| y.parse::<u32>().ok());
+
+    let price = fetch_price(&edge, &destination()).await;
+    let identity = fetch_identity(&terminus()).await;
+    let (event, id) = signed_arns_buy_job(&name, process_id.as_deref(), &buy_type, years, price);
+    let (prepare, shared_secret) = sealed_prepare(
+        price,
+        &destination(),
+        &target(),
+        &store_job_body(&event),
+        &identity,
+    );
+
+    match process_id.as_deref() {
+        Some(pid) => println!(
+            "SPENDING ARIO -- kind:5095 buy of {name:?} ({buy_type}), ANT {pid}, event {id}"
+        ),
+        None => println!(
+            "VALIDATION PROBE -- kind:5095 for {name:?} with NO processId; \
+             expecting the handler to refuse by name. No ARIO can move. event {id}"
+        ),
+    }
+
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .expect("http client")
+        .post(format!("{edge}/ilp"))
+        .header(CLAIM_HEADER, BASE64.encode(payer.claim_json().as_bytes()))
+        .body(prepare.encode())
+        .send()
+        .await
+        .expect("POST /ilp");
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = response.bytes().await.expect("body");
+
+    let fulfill = match Fulfill::decode(&bytes) {
+        Ok(fulfill) => fulfill,
+        Err(_) => {
+            let reject = Reject::decode(&bytes).expect("neither FULFILL nor REJECT");
+            panic!(
+                "expected a FULFILL, got REJECT {} from {}: {}",
+                reject.code.as_str(),
+                reject.triggered_by,
+                reject.message
+            );
+        }
+    };
+    assert_eq!(fulfill.fulfillment, derive_fulfillment(&shared_secret));
+
+    let opened = open_response(&shared_secret, &fulfill.data).expect("open the sealed answer");
+    let envelope = EnvelopeResponse::decode(&opened).expect("decode envelope");
+    let body = String::from_utf8_lossy(&envelope.body).to_string();
+    println!("store app answered (status {}): {body}", envelope.status);
+
+    match process_id {
+        // The validation probe: reaching a NAMED refusal is the whole point.
+        // It proves the paid packet was carried, unsealed, and handed to the
+        // 5095 handler, which then declined on its own terms.
+        None => {
+            assert!(
+                body.contains("processId"),
+                "expected the handler's own missing-processId refusal, got: {body}"
+            );
+            println!(
+                "PROVEN -- the paid 5095 path reaches the arns-buy handler, and it \
+                 refuses a job with no ANT rather than registering on a placeholder. \
+                 This is the rig#41 failure mode being structurally impossible."
+            );
+        }
+        // The real buy.
+        Some(_) => {
+            let answer: serde_json::Value =
+                serde_json::from_str(&body).expect("the store app's answer was not JSON");
+            assert_eq!(envelope.status, 200, "the store app refused the buy: {answer}");
+            assert_eq!(answer["accept"], true, "{answer}");
+            println!(
+                "BOUGHT -- registry tx {}, ANT {}, syncAttributes {}",
+                answer["registryTxId"], answer["processId"], answer["syncAttributesTxId"]
+            );
+        }
+    }
+}
