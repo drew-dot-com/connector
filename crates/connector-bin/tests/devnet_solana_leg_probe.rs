@@ -277,6 +277,34 @@ fn mint() -> Pubkey {
         .expect("SOLANA_PROBE_MINT is a base58 mint address")
 }
 
+/// The cluster the claim declares, derived from the RPC URL rather than
+/// written as a literal.
+///
+/// This was `"devnet"` hardcoded in the claim body, which is a footgun the
+/// node does not catch: `parse_solana` validates `cluster` only against the
+/// fixed list `["mainnet-beta", "devnet", "testnet", "localnet"]` and never
+/// against the chain the node is actually configured for
+/// (`crates/connector-domain/src/client_claim.rs`). So a probe pointed at
+/// mainnet with a stale literal here produces a claim that is accepted in
+/// full while misdescribing which chain the payment happened on -- the one
+/// thing a payment record must not do. Deriving it from `SOLANA_PROBE_RPC`
+/// makes the two impossible to disagree.
+fn cluster() -> String {
+    if let Some(value) = env("SOLANA_PROBE_CLUSTER") {
+        return value;
+    }
+    let url = env("SOLANA_PROBE_RPC").unwrap_or_else(|| DEFAULT_RPC_URL.to_string());
+    if url.contains("mainnet") {
+        "mainnet-beta".to_string()
+    } else if url.contains("testnet") {
+        "testnet".to_string()
+    } else if url.contains("devnet") {
+        "devnet".to_string()
+    } else {
+        "localnet".to_string()
+    }
+}
+
 async fn submit(
     client: &RpcClient,
     payer: &Keypair,
@@ -395,7 +423,7 @@ fn solana_claim_json(
             "transferredAmount": "{amount}",
             "signature": "{signature}",
             "signerPublicKey": "{signer}",
-            "cluster": "devnet"
+            "cluster": "{cluster}"
         }}"#,
         // `Z`, not `+00:00` -- the claim gate refuses the offset spelling by
         // name, and `chrono`'s plain `to_rfc3339()` emits exactly that.
@@ -403,6 +431,7 @@ fn solana_claim_json(
         signer = payer.pubkey(),
         program = program_id(),
         channel = channel_account,
+        cluster = cluster(),
         signature = BASE64.encode(signature.as_ref()),
     )
 }
