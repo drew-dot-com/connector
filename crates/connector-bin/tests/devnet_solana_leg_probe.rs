@@ -134,6 +134,22 @@ fn destination() -> String {
     env("SOLANA_PROBE_DESTINATION").unwrap_or_else(|| "g.drew.relay".to_string())
 }
 
+/// Whether `destination` is a blob-storage (`.ario`/`.store`) route rather than
+/// a relay one.
+///
+/// Matched as a dot-separated SEGMENT, not a suffix. Size-tiered routes append
+/// their own suffix -- `g.drew.ario.xl` is still an ario route -- and a
+/// `ends_with` test silently misclassified them, which is expensive twice over:
+/// the wrong envelope target (see [`target`]) and the wrong job body (see
+/// [`job_body_for`]). Both failure modes are F00s that the payer is charged in
+/// full for (connector#869), so this predicate is the single place to get it
+/// right.
+fn is_blob_route(destination: &str) -> bool {
+    destination
+        .split('.')
+        .any(|segment| segment == "ario" || segment == "store")
+}
+
 /// The envelope target, defaulted BY ROUTE because the two routes want
 /// opposite things and getting it wrong is an F00 that reads like a client
 /// bug:
@@ -153,8 +169,7 @@ fn target() -> String {
     match std::env::var("SOLANA_PROBE_TARGET") {
         Ok(value) => value,
         Err(_) => {
-            let destination = destination();
-            if destination.ends_with(".ario") || destination.ends_with(".store") {
+            if is_blob_route(&destination()) {
                 String::new()
             } else {
                 "/write".to_string()
@@ -734,6 +749,70 @@ fn signed_blob_storage_job(
     (event, id)
 }
 
+/// NIP-90 ArNS brokered-buy job (kind:5095).
+///
+/// ⚠️ Its arguments are `["param", k, v]` tags, NOT the `["i", ...]` input tags
+/// kind:5094 uses. The handler requires `name` and `processId`.
+///
+/// ⭐ **Omitting `processId` is the ZERO-ARIO validation mode.** The handler
+/// parses the event, finds the required param missing, and refuses BY NAME
+/// before it ever quotes or touches the ar.io registry. That proves the entire
+/// paid path (settlement, routing, envelope, event signature, handler dispatch)
+/// without moving a single $ARIO, which is the only safe way to rehearse a job
+/// that otherwise spends real money on a real registry.
+const ARNS_BUY_REQUEST_KIND: u64 = 5095;
+
+fn signed_arns_buy_job(
+    name: &str,
+    process_id: Option<&str>,
+    buy_type: &str,
+    years: Option<u32>,
+    bid: u64,
+) -> (serde_json::Value, String) {
+    use k256::schnorr::signature::hazmat::PrehashSigner;
+    use k256::schnorr::SigningKey;
+    use sha2::{Digest, Sha256};
+
+    let mut seed = [0u8; 32];
+    seed[..8].copy_from_slice(&now_secs().to_be_bytes());
+    seed[8..24].copy_from_slice(&Sha256::digest(name.as_bytes())[..16]);
+    seed[31] |= 1;
+    let signing_key = SigningKey::from_bytes(&seed).expect("nostr signing key");
+    let pubkey = hex_encode(&signing_key.verifying_key().to_bytes());
+    let created_at = now_secs();
+
+    let mut tag_list = vec![
+        serde_json::json!(["param", "name", name]),
+        serde_json::json!(["param", "type", buy_type]),
+        serde_json::json!(["bid", bid.to_string(), "usdc"]),
+    ];
+    if let Some(pid) = process_id {
+        tag_list.push(serde_json::json!(["param", "processId", pid]));
+    }
+    if let Some(y) = years {
+        tag_list.push(serde_json::json!(["param", "years", y.to_string()]));
+    }
+    let tags = serde_json::Value::Array(tag_list);
+
+    let serialized =
+        serde_json::json!([0, pubkey, created_at, ARNS_BUY_REQUEST_KIND, tags, ""]).to_string();
+    let id = hex_encode(&Sha256::digest(serialized.as_bytes()));
+    let signature: k256::schnorr::Signature = signing_key
+        .sign_prehash(&hex_decode(&id))
+        .expect("schnorr sign the event id");
+
+    let event = serde_json::json!({
+        "id": id,
+        "pubkey": pubkey,
+        "created_at": created_at,
+        "kind": ARNS_BUY_REQUEST_KIND,
+        "tags": tags,
+        "content": "",
+        "sig": hex_encode(&signature.to_bytes()),
+    });
+    (event, id)
+}
+
 /// How many KiB the blob-storage job should carry, from `SOLANA_PROBE_BLOB_KB`.
 ///
 /// Exists to cross AR.IO's free-tier boundary deliberately. Turbo grants free
@@ -768,15 +847,27 @@ fn padded_blob(note: &str, kb: usize) -> Vec<u8> {
 /// names what it did with it. An `.ario`/`.store` route gets a kind:5094
 /// blob-storage job; anything else gets a relay write.
 ///
-/// Matched as a SEGMENT rather than a suffix: size-tiered routes append their
-/// own suffix (`g.drew.ario.xl`), and a plain `ends_with` silently sent those a
-/// relay write instead. Under ADR 0020 that is not a loud failure -- the app's
-/// 422 rides home on a FULFILL and the payer is charged in full for nothing.
+/// Routing decided by [`is_blob_route`] -- see there for why a suffix test was
+/// wrong. Under ADR 0020 misclassifying is not a loud failure: the app's 422
+/// rides home on a FULFILL and the payer is charged in full for nothing.
 fn job_body_for(destination: &str, note: &str, price: u64) -> (Vec<u8>, String, &'static str) {
-    let is_blob_route = destination
-        .split('.')
-        .any(|segment| segment == "ario" || segment == "store");
-    if is_blob_route {
+    if is_blob_route(destination) {
+        // kind:5095 takes precedence on a blob route when a name is named.
+        // ⚠️ SPENDS REAL $ARIO on a real registry when ARNS_PROBE_PROCESS_ID is
+        // also set. Without it, the handler refuses by name and nothing moves.
+        if let Some(name) = env("ARNS_PROBE_NAME") {
+            let process_id = env("ARNS_PROBE_PROCESS_ID");
+            let buy_type = env("ARNS_PROBE_TYPE").unwrap_or_else(|| "lease".to_string());
+            let years = env("ARNS_PROBE_YEARS").and_then(|y| y.parse::<u32>().ok());
+            let (event, id) =
+                signed_arns_buy_job(&name, process_id.as_deref(), &buy_type, years, price);
+            let field = if process_id.is_some() {
+                "arnsResult"
+            } else {
+                "arnsRefusal"
+            };
+            return (write_body(&event), id, field);
+        }
         let blob = padded_blob(note, blob_kb());
         let (event, id) = signed_blob_storage_job(&blob, "text/plain", price);
         (write_body(&event), id, "txId")
@@ -1100,6 +1191,29 @@ async fn a_paid_solana_claim_buys_a_write_and_advances_the_watermark() {
         envelope.status,
         String::from_utf8_lossy(&envelope.body)
     );
+    // ⭐ The zero-ARIO ArNS rehearsal INVERTS the usual expectation: a refusal
+    // is the pass. The packet was paid for and delivered, and the handler got
+    // far enough to parse the event and find `processId` missing. Asserting
+    // 2xx here would report a successful rehearsal as a failure.
+    if answer_field == "arnsRefusal" {
+        let body = String::from_utf8_lossy(&envelope.body);
+        assert!(
+            !(200..300).contains(&envelope.status),
+            "a 5095 job with no processId must be REFUSED, not accepted: {body}"
+        );
+        assert!(
+            body.contains("processId"),
+            "the handler must refuse for the missing processId specifically, \
+             not for some earlier failure that would prove nothing: {body}"
+        );
+        println!(
+            "ZERO-ARIO REHEARSAL PASSED -- paid, routed, and refused by name \
+             (status {}). No $ARIO moved.",
+            envelope.status
+        );
+        return;
+    }
+
     assert!(
         (200..300).contains(&envelope.status),
         "the app refused the write: {}",
@@ -1107,6 +1221,16 @@ async fn a_paid_solana_claim_buys_a_write_and_advances_the_watermark() {
     );
     let stored: serde_json::Value =
         serde_json::from_slice(&envelope.body).expect("the app's JSON answer");
+    if answer_field == "arnsResult" {
+        println!("ArNS receipt: {}", stored["result"]);
+        assert!(
+            stored["result"]["registryTxId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "a real ArNS buy must answer with a registry tx id: {stored}"
+        );
+        return;
+    }
     // A relay names the event id it stored; an ario/store app names the
     // Arweave tx id it minted. Either way the answer is the app's own word
     // about work it did, not this probe's about a packet it sent.
