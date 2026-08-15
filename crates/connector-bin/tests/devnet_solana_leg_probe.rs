@@ -734,12 +734,51 @@ fn signed_blob_storage_job(
     (event, id)
 }
 
+/// How many KiB the blob-storage job should carry, from `SOLANA_PROBE_BLOB_KB`.
+///
+/// Exists to cross AR.IO's free-tier boundary deliberately. Turbo grants free
+/// uploads to any signer up to ~100 KB, so a small blob proves the ILP leg but
+/// never exercises the store's PAID upload path. Default 0 = the note alone,
+/// which keeps every existing invocation byte-identical.
+fn blob_kb() -> usize {
+    match env("SOLANA_PROBE_BLOB_KB") {
+        Some(value) => value
+            .parse()
+            .expect("SOLANA_PROBE_BLOB_KB is a whole number of KiB"),
+        None => 0,
+    }
+}
+
+/// The self-describing note, padded out to `kb` KiB.
+///
+/// The note stays at the FRONT so the artifact still names its own channel and
+/// nonce to anyone who fetches it -- padding must not cost the payload its
+/// third-party verifiability.
+fn padded_blob(note: &str, kb: usize) -> Vec<u8> {
+    let mut blob = note.as_bytes().to_vec();
+    let target = kb * 1024;
+    if blob.len() < target {
+        blob.push(b'\n');
+        blob.resize(target, b'.');
+    }
+    blob
+}
+
 /// The right body for `destination`, and the field of the app's answer that
-/// names what it did with it. A `.ario`/`.store` prefix gets a kind:5094
+/// names what it did with it. An `.ario`/`.store` route gets a kind:5094
 /// blob-storage job; anything else gets a relay write.
+///
+/// Matched as a SEGMENT rather than a suffix: size-tiered routes append their
+/// own suffix (`g.drew.ario.xl`), and a plain `ends_with` silently sent those a
+/// relay write instead. Under ADR 0020 that is not a loud failure -- the app's
+/// 422 rides home on a FULFILL and the payer is charged in full for nothing.
 fn job_body_for(destination: &str, note: &str, price: u64) -> (Vec<u8>, String, &'static str) {
-    if destination.ends_with(".ario") || destination.ends_with(".store") {
-        let (event, id) = signed_blob_storage_job(note.as_bytes(), "text/plain", price);
+    let is_blob_route = destination
+        .split('.')
+        .any(|segment| segment == "ario" || segment == "store");
+    if is_blob_route {
+        let blob = padded_blob(note, blob_kb());
+        let (event, id) = signed_blob_storage_job(&blob, "text/plain", price);
         (write_body(&event), id, "txId")
     } else {
         let (event, id) = signed_nostr_event(note);
