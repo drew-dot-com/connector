@@ -1101,3 +1101,382 @@ async fn a_paid_solana_claim_buys_a_write_and_advances_the_watermark() {
         "the channel advanced by exactly the route's price"
     );
 }
+
+// ── 5. the channel lifecycle: redeem on chain, close, settle ─────────────────
+
+/// The three paths `toon-meta/docs/soak-criteria.md` §1 records as **not yet
+/// observed** for the Solana family: a claim redeemed on chain, a channel
+/// closed, and a vault settled back to its participants. Nothing has ever been
+/// redeemed on chain on any TOON chain, and no Solana channel has ever been
+/// closed, which is exactly why that family's soak clock has not started.
+///
+/// Gated on `SOLANA_PROBE_LIFECYCLE=1`, separately from every other gate in
+/// this file, because it is the only test here that **ends** a channel. Every
+/// other path is repeatable; this one is not, and against mainnet it moves
+/// real money.
+///
+/// ## Resumable by design
+///
+/// `SettleChannel` cannot run until the challenge window elapses:
+/// `process_settlement` rejects with `ChannelChallengeNotExpired` until
+/// `close_timestamp + challenge_duration`, which is 3600s on a channel opened
+/// with this probe's default. Rather than hold a test process open for an
+/// hour, each phase reads the chain and skips whatever is already done -- so
+/// the same command, run twice about an hour apart, walks the channel through
+/// the whole lifecycle and prints one transaction signature per phase.
+///
+/// ## Why the payer can do all three alone
+///
+/// The payer is the `claimer` of its own balance proof even though the credit
+/// ultimately flows to the node. `process_claim_from_channel` records
+/// `transferred_amount` against whichever participant's signature the Ed25519
+/// precompile verified, and settlement pays out
+/// `deposit_x - transferred_x + transferred_y`. The node never signs anything
+/// here: per the account-list comment at `processor.rs:671-675`, the fee-payer
+/// is deliberately decoupled from the claiming participant. `CloseChannel`
+/// requires a signer that is *a* participant, and `SettleChannel` requires only
+/// a signer. So none of this needs the node's settlement key.
+///
+/// ## What it redeems
+///
+/// Not a nonce and amount written here, but the ones the **node** says it
+/// accepted, read back from `/ilp/claim-state`. Redeeming anything else would
+/// put the chain and the node's own durable watermark into disagreement, and
+/// the watermark is the number the soak bar is counted in. Override with
+/// `SOLANA_PROBE_CLAIM_NONCE` + `SOLANA_PROBE_CLAIM_UNITS` only when the node
+/// is unreachable and the values are known from elsewhere.
+#[tokio::test]
+async fn redeem_close_and_settle_this_channel() {
+    let (Some(edge), Some(node), Some(payer)) = (edge(), node_pubkey(), payer()) else {
+        return;
+    };
+    if env("SOLANA_PROBE_LIFECYCLE").is_none() {
+        return;
+    }
+    // `SOLANA_PROBE_DRY_RUN=1` prints what each phase would submit and signs
+    // nothing. Worth having on the one path in this file that cannot be re-run:
+    // the cost of being wrong here is not a wasted minute, it is a channel
+    // closed early or a claim redeemed at the wrong nonce.
+    let dry_run = env("SOLANA_PROBE_DRY_RUN").is_some();
+    if dry_run {
+        println!("── DRY RUN: reading chain state and reporting the plan, signing nothing ──");
+    }
+    let client = rpc();
+    let mint = mint();
+    let program = program_id();
+    let payer_pubkey = payer.pubkey();
+
+    let (account, channel) = read_channel(&client, &payer_pubkey, &node, &mint).await;
+    let Some(channel) = channel else {
+        // A settled channel's account is zeroed and deallocated by the program
+        // itself, so "never existed" and "already settled" are indistinguishable
+        // from chain (`wire::ChannelAccount::parse`'s own doc says so). Report
+        // both rather than calling a finished lifecycle a broken node.
+        println!(
+            "channel {account} does not exist on chain -- either it was never opened, or it \
+             has already been settled and the program deallocated its account"
+        );
+        return;
+    };
+
+    let status = channel.parsed.status;
+    println!(
+        "channel {account}\n  status={status:?} challenge={}s\n  \
+         deposit_a={} transferred_a={} nonce_a={}\n  \
+         deposit_b={} transferred_b={} nonce_b={}",
+        channel.parsed.challenge_duration,
+        channel.parsed.deposit_a,
+        channel.parsed.transferred_amount_a,
+        channel.parsed.nonce_a,
+        channel.parsed.deposit_b,
+        channel.parsed.transferred_amount_b,
+        channel.parsed.nonce_b,
+    );
+
+    let payer_is_a = channel.parsed.participant_a == payer_pubkey;
+    assert!(
+        payer_is_a || channel.parsed.participant_b == payer_pubkey,
+        "this keypair is not a participant of {account} -- it cannot close or claim on it"
+    );
+    let (stored_nonce, stored_transferred) = if payer_is_a {
+        (channel.parsed.nonce_a, channel.parsed.transferred_amount_a)
+    } else {
+        (channel.parsed.nonce_b, channel.parsed.transferred_amount_b)
+    };
+
+    // What phase 1 redeems, remembered so phase 3 can project it into the
+    // payout it reports. Without this a dry run reads the payout off an
+    // account that has not been claimed against yet, and reports the recipient
+    // receiving nothing -- which is the exact opposite of what the run proves.
+    let mut planned_transferred: Option<u64> = None;
+
+    // ── phase 1: ClaimFromChannel ────────────────────────────────────────────
+    //
+    // Allowed while the channel is Opened OR Closed (`processor.rs:731-741`
+    // rejects only Settled), so a claim missed before the close can still be
+    // redeemed during the challenge window -- which is the entire point of
+    // having one.
+    if status != wire::ChannelStatus::Settled {
+        let target = match (
+            env("SOLANA_PROBE_CLAIM_NONCE"),
+            env("SOLANA_PROBE_CLAIM_UNITS"),
+        ) {
+            (Some(nonce), Some(units)) => Some((
+                nonce
+                    .parse::<u64>()
+                    .expect("SOLANA_PROBE_CLAIM_NONCE is a u64"),
+                units
+                    .parse::<u64>()
+                    .expect("SOLANA_PROBE_CLAIM_UNITS is a u64"),
+            )),
+            _ => fetch_claim_state(&edge, &account, &payer)
+                .await
+                .map(|state| {
+                    let units = u64::try_from(state.cumulative)
+                        .expect("the node's cumulative fits a u64 of base units");
+                    (state.nonce, units)
+                }),
+        };
+
+        match target {
+            None => println!(
+                "no claim state available from the node and no explicit override -- skipping \
+                 the redemption phase rather than guessing a nonce"
+            ),
+            Some((nonce, units)) if nonce <= stored_nonce => println!(
+                "nothing to redeem: the node's claim (nonce {nonce}, {units} units) is not \
+                 ahead of the chain's stored nonce {stored_nonce} -- already redeemed"
+            ),
+            Some((nonce, units)) => {
+                assert!(
+                    units >= stored_transferred,
+                    "refusing to submit a claim that decreases transferred_amount \
+                     ({units} < {stored_transferred}): the program rejects it \
+                     (TransferredAmountDecreased) and it would mean the node's watermark \
+                     disagrees with the chain"
+                );
+                let deposit = channel.payer_deposit(&payer_pubkey);
+                assert!(
+                    units <= deposit,
+                    "refusing to submit a claim above the payer's own deposit \
+                     ({units} > {deposit}): the program bounds it there precisely so the \
+                     channel stays settleable (`processor.rs`'s deposit bound)"
+                );
+
+                // Signed here rather than replayed from the node, because the node
+                // stores what it verified, not the 64 signature bytes. Same key,
+                // same message, so the precompile sees an identical proof.
+                let message = wire::balance_proof_message(&account, nonce, units);
+                let signature: [u8; 64] = payer
+                    .sign_message(&message)
+                    .as_ref()
+                    .try_into()
+                    .expect("an ed25519 signature is 64 bytes");
+
+                planned_transferred = Some(units);
+                println!("redeeming nonce {nonce}, {units} base units, on chain");
+                if dry_run {
+                    println!(
+                        "   DRY RUN -- would submit ClaimFromChannel(nonce={nonce}, \
+                         transferred={units}) for claimer {payer_pubkey}, behind an Ed25519 \
+                         proof at instruction index 0"
+                    );
+                } else {
+                    let tx = submit(
+                        &client,
+                        &payer,
+                        &[
+                            // Index 0 is not a style choice: `verify_ed25519_precompile`
+                            // calls `load_instruction_at_checked(0, ..)`, so the proof
+                            // must sit ahead of the instruction it authorizes.
+                            wire::ed25519_verify_instruction(&payer_pubkey, &signature, &message),
+                            Instruction::new_with_bytes(
+                                program,
+                                &wire::pack_claim_from_channel(nonce, units),
+                                wire::Accounts::claim_from_channel(
+                                    &payer_pubkey,
+                                    &payer_pubkey,
+                                    &account,
+                                ),
+                            ),
+                        ],
+                        "ClaimFromChannel",
+                    )
+                    .await;
+                    println!("✅ ClaimFromChannel: {tx}");
+                }
+            }
+        }
+    }
+
+    // ── phase 2: CloseChannel ────────────────────────────────────────────────
+    if status == wire::ChannelStatus::Opened {
+        println!("closing {account} -- this starts the challenge window and is not reversible");
+        if dry_run {
+            println!(
+                "   DRY RUN -- would submit CloseChannel signed by {payer_pubkey}, starting a \
+                 {}s challenge window before SettleChannel is permitted",
+                channel.parsed.challenge_duration
+            );
+        } else {
+            let tx = submit(
+                &client,
+                &payer,
+                &[Instruction::new_with_bytes(
+                    program,
+                    &wire::pack_close_channel(),
+                    wire::Accounts::close_channel(&payer_pubkey, &account),
+                )],
+                "CloseChannel",
+            )
+            .await;
+            println!("✅ CloseChannel: {tx}");
+        }
+    }
+
+    // ── phase 3: SettleChannel ───────────────────────────────────────────────
+    //
+    // Re-read rather than reusing the pre-close snapshot: `close_timestamp` is
+    // written by the program from its own `Clock`, and it is what the deadline
+    // below is computed from.
+    let (_account, settled_view) = read_channel(&client, &payer_pubkey, &node, &mint).await;
+    let Some(current) = settled_view else {
+        println!("channel account is gone -- nothing left to settle");
+        return;
+    };
+    let is_closed = current.parsed.status == wire::ChannelStatus::Closed;
+    let deadline = current.parsed.close_timestamp + current.parsed.challenge_duration as i64;
+    let remaining = deadline - now_secs() as i64;
+    let settle_ready = is_closed && remaining <= 0;
+
+    if !settle_ready {
+        if is_closed {
+            println!(
+                "⏳ challenge window open for another {remaining}s ({}m). Settle is refused \
+                 until then (ChannelChallengeNotExpired). Re-run this same command after that \
+                 and it will pick up at the settle phase.",
+                remaining / 60
+            );
+        } else {
+            println!(
+                "channel is {:?}, not Closed -- nothing to settle yet",
+                current.parsed.status
+            );
+        }
+        // A dry run deliberately keeps going here. The associated-token-account
+        // pre-flight below is the most useful check available before any money
+        // moves, and it does not depend on the channel already being closed --
+        // so surfacing a missing ATA now is worth more than an early return.
+        if !dry_run {
+            return;
+        }
+    }
+
+    // Both participants' associated token accounts must already exist: the
+    // program transfers into them and does not create them. A missing node-side
+    // ATA is the one failure here that looks like a program bug and is not, so
+    // it is checked by name before anything is submitted.
+    let payer_token =
+        spl_associated_token_account::get_associated_token_address(&payer_pubkey, &mint);
+    let node_token = spl_associated_token_account::get_associated_token_address(&node, &mint);
+    for (owner, ata, label) in [
+        (payer_pubkey, payer_token, "payer"),
+        (node, node_token, "node"),
+    ] {
+        let exists = client
+            .get_account_with_commitment(&ata, CommitmentConfig::confirmed())
+            .await
+            .expect("getAccountInfo")
+            .value
+            .is_some();
+        assert!(
+            exists,
+            "the {label}'s associated token account {ata} (owner {owner}, mint {mint}) does \
+             not exist. SettleChannel transfers into it and cannot create it, so settlement \
+             would fail with an opaque token-program error. Create it first -- it is \
+             permissionless and costs about 0.002 SOL: \
+             `spl-token create-account {mint} --owner {owner} --fee-payer <your keypair>`"
+        );
+    }
+
+    let (vault, _bump) = wire::vault_pda(&account, &program);
+    let (participant_a_token, participant_b_token) = if payer_is_a {
+        (payer_token, node_token)
+    } else {
+        (node_token, payer_token)
+    };
+
+    println!("✅ both associated token accounts exist -- settlement has somewhere to pay out to");
+
+    // The payouts settlement will make, computed here from the same formula
+    // `process_settlement` uses, so a dry run says what the money does rather
+    // than only that it moves.
+    // On a real run the claim has already landed, so the re-read account
+    // carries it. On a dry run nothing was submitted and the account still
+    // shows the pre-claim amounts, so the claim phase 1 planned is projected in
+    // here. Reporting the unprojected figure would say the recipient receives
+    // nothing, when crediting the recipient is the whole point of the exercise.
+    let (transferred_a, transferred_b) = match planned_transferred {
+        Some(units) if dry_run && payer_is_a => (units, current.parsed.transferred_amount_b),
+        Some(units) if dry_run => (current.parsed.transferred_amount_a, units),
+        _ => (
+            current.parsed.transferred_amount_a,
+            current.parsed.transferred_amount_b,
+        ),
+    };
+    let balance_a = current.parsed.deposit_a - transferred_a + transferred_b;
+    let balance_b = current.parsed.deposit_b - transferred_b + transferred_a;
+    let basis = if planned_transferred.is_some() && dry_run {
+        "payout at settle (projecting the claim above)"
+    } else {
+        "payout at settle"
+    };
+    println!(
+        "{basis}: participant_a {participant_a_token} <- {balance_a}, \
+         participant_b {participant_b_token} <- {balance_b} (base units)"
+    );
+
+    if !settle_ready {
+        println!(
+            "   DRY RUN -- would submit SettleChannel from vault {vault}, deallocating the \
+             channel and vault accounts and returning their rent to {payer_pubkey}"
+        );
+        return;
+    }
+
+    println!("settling {account}: vault {vault} -> {participant_a_token} / {participant_b_token}");
+    if dry_run {
+        println!(
+            "   DRY RUN -- would submit SettleChannel now (the challenge window has already \
+             elapsed), deallocating the channel and vault accounts and returning their rent \
+             to {payer_pubkey}"
+        );
+        return;
+    }
+    let tx = submit(
+        &client,
+        &payer,
+        &[Instruction::new_with_bytes(
+            program,
+            &wire::pack_settle_channel(),
+            wire::Accounts::settle_channel(
+                &payer_pubkey,
+                &account,
+                &vault,
+                &participant_a_token,
+                &participant_b_token,
+                // Rent recipient: the channel and vault accounts are deallocated
+                // here and their rent has to land somewhere. It goes back to the
+                // wallet that funded them.
+                &payer_pubkey,
+            ),
+        )],
+        "SettleChannel",
+    )
+    .await;
+    println!("✅ SettleChannel: {tx}");
+    println!(
+        "channel {account} is settled. The account is now deallocated, so a later read of it \
+         returns nothing -- that is success, not a missing channel."
+    );
+}
