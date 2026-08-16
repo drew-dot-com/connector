@@ -815,10 +815,16 @@ fn signed_arns_buy_job(
 
 /// How many KiB the blob-storage job should carry, from `SOLANA_PROBE_BLOB_KB`.
 ///
-/// Exists to cross AR.IO's free-tier boundary deliberately. Turbo grants free
-/// uploads to any signer up to ~100 KB, so a small blob proves the ILP leg but
-/// never exercises the store's PAID upload path. Default 0 = the note alone,
-/// which keeps every existing invocation byte-identical.
+/// Exists to cross AR.IO's free-tier boundary deliberately, so the store's PAID
+/// upload path is exercised rather than only the ILP leg. The boundary is not
+/// the commonly quoted "100 KB": AR.IO's own service descriptor reports
+/// `freeUploadLimitBytes: 107520` with `freeTier.maxItemBytes: 107520`, plus
+/// CUMULATIVE `lifetimeBytes` and `ipBytes` of 10485760 each. So a single item
+/// must exceed 105 KiB to be charged for, and separately a wallet or a source
+/// IP stops being free forever after 10 MiB in total.
+///
+/// Default 0 = the note alone, which keeps every existing invocation
+/// byte-identical.
 fn blob_kb() -> usize {
     match env("SOLANA_PROBE_BLOB_KB") {
         Some(value) => value
@@ -826,6 +832,36 @@ fn blob_kb() -> usize {
             .expect("SOLANA_PROBE_BLOB_KB is a whole number of KiB"),
         None => 0,
     }
+}
+
+/// A file whose bytes become the blob verbatim, from `SOLANA_PROBE_BLOB_FILE`.
+///
+/// `SOLANA_PROBE_BLOB_KB` pads a note with dots, which proves the paid path but
+/// stores nothing anyone would want to read back. This carries a real artifact
+/// instead -- an HTML page, an image, a manifest -- so the thing on Arweave is
+/// worth resolving an ArNS name at.
+///
+/// Takes precedence over `SOLANA_PROBE_BLOB_KB` when both are set: a caller who
+/// named a file meant that file, and silently appending dots to it would
+/// corrupt any format with a trailing structure. Unset, behaviour is unchanged.
+fn blob_file() -> Option<Vec<u8>> {
+    let path = env("SOLANA_PROBE_BLOB_FILE")?;
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|err| panic!("SOLANA_PROBE_BLOB_FILE {path} is unreadable: {err}"));
+    assert!(
+        !bytes.is_empty(),
+        "SOLANA_PROBE_BLOB_FILE {path} is empty -- refusing to pay to store nothing"
+    );
+    Some(bytes)
+}
+
+/// The blob's `output` content type, from `SOLANA_PROBE_BLOB_CONTENT_TYPE`.
+///
+/// The store forwards this onto the Arweave upload's Content-Type, so it is
+/// what decides whether a gateway serves the item as a page or offers it as a
+/// download. Defaults to `text/plain`, which is what every prior run sent.
+fn blob_content_type() -> String {
+    env("SOLANA_PROBE_BLOB_CONTENT_TYPE").unwrap_or_else(|| "text/plain".to_string())
 }
 
 /// The self-describing note, padded out to `kb` KiB.
@@ -868,8 +904,11 @@ fn job_body_for(destination: &str, note: &str, price: u64) -> (Vec<u8>, String, 
             };
             return (write_body(&event), id, field);
         }
-        let blob = padded_blob(note, blob_kb());
-        let (event, id) = signed_blob_storage_job(&blob, "text/plain", price);
+        let blob = match blob_file() {
+            Some(bytes) => bytes,
+            None => padded_blob(note, blob_kb()),
+        };
+        let (event, id) = signed_blob_storage_job(&blob, &blob_content_type(), price);
         (write_body(&event), id, "txId")
     } else {
         let (event, id) = signed_nostr_event(note);
